@@ -1,15 +1,11 @@
 # Installation
-
-<p class="callout info">tested on Ubuntu 24.0.4</p>
+tested on Ubuntu 24.0.4
 
 ```bash
 sudo apt install pipx
 pipx install jupyterlab
 ```
-
-#####  
-
-##### Create PATH environment variable
+## Create PATH environment variable
 
 ```bash
 pipx ensurepath
