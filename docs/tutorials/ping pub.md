@@ -8,7 +8,7 @@ sudo apt update
 sudo apt install nginx certbot python3-certbot-nginx nodejs git yarn -y
 ```
 
-### NGINX Configuration
+/// admonition | NGINX Configuration
 #### File Configuration
 Create explorer file configuration in Nginx configuration folder
 ```
@@ -50,8 +50,9 @@ server {
 }
 ```
 Replace `explorer.dnsarz.xyz` with your own server.
+///
 
-### SSL Configuration
+/// admonition | SSL Configuration
 Install Certificate SSL
 ```
 sudo certbot --nginx --register-unsafely-without-email
@@ -63,8 +64,9 @@ After all done, you can restart NGINX
 ```
 sudo systemctl restart nginx
 ```
+///
 
-### Explorer Configuration
+/// admonition | Explorer Configuration
 Clone Repository
 ```
 cd $HOME
@@ -115,3 +117,4 @@ sudo cp -r $HOME/explorer/dist/* /usr/share/nginx/html
 sudo systemctl restart nginx
 ```
 !!! success " Open browser and test your explorer  http://ping.dnsarz.xyz"
+///
