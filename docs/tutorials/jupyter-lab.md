@@ -1,4 +1,4 @@
-# Installation
+# Jupyter Lab
 tested on Ubuntu 24.0.4
 
 ```bash
