@@ -1,5 +1,3 @@
-## Jupyter Lab
-
 !!! info "tested on Ubuntu 24.0.4"
 
 ### Install pipx and jupiterlab
