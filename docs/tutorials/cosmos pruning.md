@@ -22,3 +22,35 @@ cd ~/
 ```shell
 cosmos-pruner prune ~/.folder/data
 ```
+
+## Make auto-running with crontab
+#### Creating .sh script
+```shell
+# create files prune.sh
+# Node example : safrochain
+cd $HOME
+
+tee ~/prune.sh > /dev/null <<EOF
+sudo systemctl stop safrochaind
+cosmos-pruner prune ~/.safrochain/data/ --blocks 5
+sudo systemctl restart safrochaind
+EOF
+
+chmod +x ~/prune.sh
+```
+### Passwordless when running systemctl from user crontab
+```bash
+sudo visudo -f /etc/sudoers.d/dnsarz-systemctl
+```
+Then add this line
+```shell
+dnsarz ALL=(root) NOPASSWD: /bin/systemctl *
+```
+### Create crontab
+```shell
+crontab -e
+```
+Add this line for every saturday mid-night
+```bash
+0 0 * * 6 /home/dnsarz/prune.sh
+```
