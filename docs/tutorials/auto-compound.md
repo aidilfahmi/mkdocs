@@ -124,7 +124,7 @@ echo "[INFO] Starting auto-compound script for $CHAIN_ID"
 
     # Extract integer part of ulmn rewards correctly from .reward[]
     REWARDS=$(echo "$REWARDS_OUTPUT" | jq -r --arg denom "$DENOM" '
-        .rewards[]?
+        .total[]?
         | capture("(?<amount>[0-9.]+)(?<denom>[a-zA-Z0-9]+)")
         | select(.denom == $denom)
         | .amount
