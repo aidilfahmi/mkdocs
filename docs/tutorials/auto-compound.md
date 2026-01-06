@@ -95,8 +95,8 @@ done
 #!/bin/bash
 # ---------------- CONFIGURATION ----------------
 CHAIN_ID="lumen"                        # Change to your chain ID
-DELEGATOR_ADDRESS=""                    # Your wallet address (for querying rewards)
-VALIDATOR_ADDRESS=""                    # Your validator address
+DELEGATOR_ADDRESS="lmn1auwxmw3ycas3w3s2qe2n40syca6hrxnhup344g" # Your wallet address (for querying rewards)
+VALIDATOR_ADDRESS="lmnvaloper1auwxmw3ycas3w3s2qe2n40syca6hrxnhpnc5uk" # Your validator address
 KEY_NAME="wallet"                       # Key name in keyring
 KEYRING_BACKEND="test"                  # "os", "file", or "test"
 DENOM="ulmn"                            # Token denom (uatom, uosmo, etc.)
@@ -124,7 +124,7 @@ echo "[INFO] Starting auto-compound script for $CHAIN_ID"
 
     # Extract integer part of ulmn rewards correctly from .reward[]
     REWARDS=$(echo "$REWARDS_OUTPUT" | jq -r --arg denom "$DENOM" '
-        .total[]?
+        .rewards[]?
         | capture("(?<amount>[0-9.]+)(?<denom>[a-zA-Z0-9]+)")
         | select(.denom == $denom)
         | .amount
@@ -143,6 +143,7 @@ echo "[INFO] Starting auto-compound script for $CHAIN_ID"
         echo "[INFO] Threshold reached. Withdrawing rewards + commission..."
 
         WITHDRAW_OUTPUT=$($CLI_BINARY tx distribution withdraw-rewards "$VALIDATOR_ADDRESS" \
+            --commission \
             --from "$KEY_NAME" \
             --chain-id "$CHAIN_ID" \
             --keyring-backend "$KEYRING_BACKEND" \
@@ -162,19 +163,29 @@ echo "[INFO] Starting auto-compound script for $CHAIN_ID"
             sleep "$INTERVAL_SECONDS"
             continue
         fi
-        sleep 2  # Wait for tx inclusion
+
+        # Smart wait: wait until the withdraw transaction is actually in a block
+        echo "[INFO] Waiting for withdraw transaction to be included in a block..."
+        TX_HASH=$(echo "$WITHDRAW_OUTPUT" | grep -o 'txhash: [A-F0-9]\+' | cut -d' ' -f2)
+        while true; do
+            sleep 5
+            STATUS=$($CLI_BINARY query tx "$TX_HASH" --output json 2>/dev/null | jq -r '.height // "0"')
+            if [ "$STATUS" != "0" ]; then
+                echo "[INFO] Transaction included in block $STATUS"
+                break
+            fi
+        done
 
         echo "[INFO] Redelegating $REWARDS $DENOM to validator..."
 
-        DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "${REWARDS}${DENOM}" \
-            --from "$KEY_NAME" \
+        DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "$REWARDS""$DENOM" \
             --chain-id "$CHAIN_ID" \
-            --keyring-backend "$KEYRING_BACKEND" \
             --pqc-key "node-pqc" \
             --pqc-scheme "dilithium3" \
             --gas "$GAS" \
             --gas-adjustment "$GAS_ADJUSTMENT" \
             --gas-prices "0ulmn" \
+            --from "$KEY_NAME" \
             --yes 2>&1)
 
         if echo "$DELEGATE_OUTPUT" | grep code:[[:space:]]*0; then
@@ -191,5 +202,4 @@ echo "[INFO] Starting auto-compound script for $CHAIN_ID"
 #    echo "[INFO] Sleeping for $INTERVAL_SECONDS seconds..."
 #    sleep "$INTERVAL_SECONDS"
 #done
-
 ```
