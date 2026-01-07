@@ -4,10 +4,10 @@
 #### Wallet using keyring-backend = file
 ```bash
 # Create wallet
-atomoned keys add wallet --keyring-backend
+atomoned keys add wallet --keyring-backend file
 
 # Recovery
-atomoned keys add wallet --keyring-backend --recovery
+atomoned keys add wallet --keyring-backend file --recovery
 ```
 #### Create .keypass file for password authentication
 ```bash
