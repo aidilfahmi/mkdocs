@@ -93,113 +93,109 @@ done
 
 ```bash
 #!/bin/bash
+set -euo pipefail
+
+# ---------- CRON SAFE ENV ----------
+export PATH=/usr/local/bin:/usr/bin:/bin:/home/dnsarz/go/bin
+
 # ---------------- CONFIGURATION ----------------
-CHAIN_ID="lumen"                        # Change to your chain ID
-DELEGATOR_ADDRESS="lmn1auwxmw3ycas3w3s2qe2n40syca6hrxnhup344g" # Your wallet address (for querying rewards)
-VALIDATOR_ADDRESS="lmnvaloper1auwxmw3ycas3w3s2qe2n40syca6hrxnhpnc5uk" # Your validator address
+CHAIN_ID="lumen"
+DELEGATOR_ADDRESS="lmn1auwxmw3ycas3w3s2qe2n40syca6hrxnhup344g"          # Your wallet address
+VALIDATOR_ADDRESS="lmnvaloper1auwxmw3ycas3w3s2qe2n40syca6hrxnhpnc5uk"   # Your validator address
 KEY_NAME="wallet"                       # Key name in keyring
 KEYRING_BACKEND="test"                  # "os", "file", or "test"
 DENOM="ulmn"                            # Token denom (uatom, uosmo, etc.)
 GAS="auto"
 GAS_ADJUSTMENT="1.5"
-INTERVAL_SECONDS=10                     # How often to run (1 hour)
-MIN_RESTAKE_AMOUNT=200000               # Minimum amount to restake (in base denom, e.g., 100000 uatom = 0.1 ATOM)
-CLI_BINARY="lumend"                     # Path to CLI binary (gaiad, osmosisd, etc.)
+MIN_RESTAKE_AMOUNT=1000000              # Minimum amount to restake
+CLI_BINARY="/home/dnsarz/go/bin/lumend" # Path to CLI binary (gaiad, osmosisd, etc.)
+JQ_BIN="/usr/bin/jq"                    # # Path to JQ
 # ------------------------------------------------
 
+
 echo "[INFO] Starting auto-compound script for $CHAIN_ID"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking rewards..."
 
-#while true; do
-    echo ""
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking rewards..."
+# ---------------- QUERY REWARDS ----------------
+REWARDS_OUTPUT=$($CLI_BINARY query distribution rewards "$DELEGATOR_ADDRESS" -o json 2>/dev/null || true)
 
-    # Query rewards specifically from your validator (more accurate and efficient)
-    REWARDS_OUTPUT=$($CLI_BINARY query distribution rewards "$DELEGATOR_ADDRESS" -o json 2>/dev/null)
+if [ -z "$REWARDS_OUTPUT" ]; then
+    echo "[ERROR] Failed to query rewards (RPC issue or wrong addresses?)"
+    exit 1
+fi
 
-    if [ $? -ne 0 ] || [ -z "$REWARDS_OUTPUT" ]; then
-        echo "[ERROR] Failed to query rewards (RPC issue or wrong addresses?)"
-        sleep "$INTERVAL_SECONDS"
-        continue
+REWARDS=$(echo "$REWARDS_OUTPUT" | $JQ_BIN -r --arg denom "$DENOM" '
+    .total[]?
+    | capture("(?<amount>[0-9.]+)(?<denom>[a-zA-Z0-9]+)")
+    | select(.denom == $denom)
+    | .amount
+    | tonumber
+    | floor
+' 2>/dev/null || echo 0)
+
+REWARDS=${REWARDS:-0}
+
+echo "[INFO] Current delegator rewards: $REWARDS $DENOM"
+
+# ---------------- CHECK THRESHOLD ----------------
+if [ "$REWARDS" -lt "$MIN_RESTAKE_AMOUNT" ]; then
+    echo "[INFO] Rewards below threshold ($MIN_RESTAKE_AMOUNT $DENOM), skipping."
+    exit 0
+fi
+
+echo "[INFO] Threshold reached. Withdrawing rewards..."
+
+# ---------------- WITHDRAW REWARDS ----------------
+WITHDRAW_OUTPUT=$($CLI_BINARY tx distribution withdraw-rewards "$VALIDATOR_ADDRESS" \
+    --from "$KEY_NAME" \
+    --chain-id "$CHAIN_ID" \
+    --keyring-backend "$KEYRING_BACKEND" \
+    --pqc-key "node-pqc" \
+    --pqc-scheme "dilithium3" \
+    --gas "$GAS" \
+    --gas-adjustment "$GAS_ADJUSTMENT" \
+    --fees "0ulmn" \
+    --yes 2>&1)
+
+if ! echo "$WITHDRAW_OUTPUT" | grep -q 'code:[[:space:]]*0'; then
+    echo "[ERROR] Withdraw failed:"
+    echo "$WITHDRAW_OUTPUT"
+    exit 1
+fi
+
+echo "[SUCCESS] Rewards withdrawn successfully"
+
+# ---------------- WAIT FOR TX ----------------
+TX_HASH=$(echo "$WITHDRAW_OUTPUT" | grep -o 'txhash: [A-F0-9]\+' | cut -d' ' -f2)
+
+echo "[INFO] Waiting for withdraw tx to be included..."
+for i in {1..20}; do
+    sleep 5
+    HEIGHT=$($CLI_BINARY query tx "$TX_HASH" -o json 2>/dev/null | $JQ_BIN -r '.height // "0"')
+    if [ "$HEIGHT" != "0" ]; then
+        echo "[INFO] Withdraw included in block $HEIGHT"
+        break
     fi
+done
 
-    # Extract integer part of ulmn rewards correctly from .reward[]
-    REWARDS=$(echo "$REWARDS_OUTPUT" | jq -r --arg denom "$DENOM" '
-        .total[]?
-        | capture("(?<amount>[0-9.]+)(?<denom>[a-zA-Z0-9]+)")
-        | select(.denom == $denom)
-        | .amount
-        | tonumber
-        | floor // 0
-    ' 2>/dev/null)
+# ---------------- DELEGATE ----------------
+echo "[INFO] Redelegating $REWARDS $DENOM..."
 
-    # Safety fallback
-    if [ -z "$REWARDS" ] || [ "$REWARDS" = "null" ]; then
-        REWARDS=0
-    fi
+DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "${REWARDS}${DENOM}" \
+    --chain-id "$CHAIN_ID" \
+    --pqc-key "node-pqc" \
+    --pqc-scheme "dilithium3" \
+    --gas "$GAS" \
+    --gas-adjustment "$GAS_ADJUSTMENT" \
+    --gas-prices "0ulmn" \
+    --from "$KEY_NAME" \
+    --yes 2>&1)
 
-    echo "[INFO] Current delegator rewards: $REWARDS $DENOM"
-
-    if [ "$REWARDS" -ge "$MIN_RESTAKE_AMOUNT" ]; then
-        echo "[INFO] Threshold reached. Withdrawing rewards + commission..."
-
-        WITHDRAW_OUTPUT=$($CLI_BINARY tx distribution withdraw-rewards "$VALIDATOR_ADDRESS" \
-            --commission \
-            --from "$KEY_NAME" \
-            --chain-id "$CHAIN_ID" \
-            --keyring-backend "$KEYRING_BACKEND" \
-            --pqc-key "node-pqc" \
-            --pqc-scheme "dilithium3" \
-            --gas "$GAS" \
-            --gas-adjustment "$GAS_ADJUSTMENT" \
-            --fees "0ulmn" \
-            --yes 2>&1)
-
-        # Correct success check: Cosmos CLI outputs "code":0 (no space)
-        if echo "$WITHDRAW_OUTPUT" | grep code:[[:space:]]*0; then
-            echo "[SUCCESS] Rewards and commission withdrawn successfully"
-        else
-            echo "[ERROR] Withdraw failed:"
-            echo "$WITHDRAW_OUTPUT"
-            sleep "$INTERVAL_SECONDS"
-            continue
-        fi
-
-        # Smart wait: wait until the withdraw transaction is actually in a block
-        echo "[INFO] Waiting for withdraw transaction to be included in a block..."
-        TX_HASH=$(echo "$WITHDRAW_OUTPUT" | grep -o 'txhash: [A-F0-9]\+' | cut -d' ' -f2)
-        while true; do
-            sleep 5
-            STATUS=$($CLI_BINARY query tx "$TX_HASH" --output json 2>/dev/null | jq -r '.height // "0"')
-            if [ "$STATUS" != "0" ]; then
-                echo "[INFO] Transaction included in block $STATUS"
-                break
-            fi
-        done
-
-        echo "[INFO] Redelegating $REWARDS $DENOM to validator..."
-
-        DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "$REWARDS""$DENOM" \
-            --chain-id "$CHAIN_ID" \
-            --pqc-key "node-pqc" \
-            --pqc-scheme "dilithium3" \
-            --gas "$GAS" \
-            --gas-adjustment "$GAS_ADJUSTMENT" \
-            --gas-prices "0ulmn" \
-            --from "$KEY_NAME" \
-            --yes 2>&1)
-
-        if echo "$DELEGATE_OUTPUT" | grep code:[[:space:]]*0; then
-            echo "[SUCCESS] Delegation successful! Compounded $REWARDS $DENOM"
-        else
-            echo "[ERROR] Delegation failed:"
-            echo "$DELEGATE_OUTPUT" | grep -i "raw_log" || echo "$DELEGATE_OUTPUT"
-        fi
-
-    else
-        echo "[INFO] Rewards below threshold ($MIN_RESTAKE_AMOUNT $DENOM), skipping."
-    fi
-
-#    echo "[INFO] Sleeping for $INTERVAL_SECONDS seconds..."
-#    sleep "$INTERVAL_SECONDS"
-#done
+if echo "$DELEGATE_OUTPUT" | grep -q 'code:[[:space:]]*0'; then
+    echo "[SUCCESS] Delegation successful! Compounded $REWARDS $DENOM"
+else
+    echo "[ERROR] Delegation failed:"
+    echo "$DELEGATE_OUTPUT"
+    exit 1
+fi
 ```
