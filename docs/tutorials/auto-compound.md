@@ -252,6 +252,7 @@ DENOM="ulmn"                            # Token denom (uatom, uosmo, etc.)
 GAS="auto"
 GAS_ADJUSTMENT="1.5"
 MIN_RESTAKE_AMOUNT=1000000              # Minimum amount to restake
+FEE_BUFFER=1000000                  # Amount to keep for future fees
 CLI_BINARY="/home/dnsarz/go/bin/lumend" # Path to CLI binary (gaiad, osmosisd, etc.)
 JQ_BIN="/usr/bin/jq"                    # # Path to JQ
 # ------------------------------------------------
@@ -309,23 +310,40 @@ fi
 
 echo "[SUCCESS] Rewards withdrawn successfully"
 
-# ---------------- WAIT FOR TX ----------------
-TX_HASH=$(echo "$WITHDRAW_OUTPUT" | grep -o 'txhash: [A-F0-9]\+' | cut -d' ' -f2)
+# ---------------- WAIT FOR BALANCE UPDATE ----------------
+echo "[INFO] Waiting for balance update..."
 
-echo "[INFO] Waiting for withdraw tx to be included..."
-for i in {1..20}; do
-    sleep 5
-    HEIGHT=$($CLI_BINARY query tx "$TX_HASH" -o json 2>/dev/null | $JQ_BIN -r '.height // "0"')
-    if [ "$HEIGHT" != "0" ]; then
-        echo "[INFO] Withdraw included in block $HEIGHT"
+for i in {1..12}; do
+    sleep 10
+    BALANCE=$($CLI_BINARY query bank balances "$DELEGATOR_ADDRESS" -o json \
+        | $JQ_BIN -r --arg denom "$DENOM" '.balances[]? | select(.denom==$denom) | .amount' \
+        | head -n1)
+
+    BALANCE=${BALANCE:-0}
+
+    if [ "$BALANCE" -ge "$REWARDS" ]; then
+        echo "[INFO] Balance updated: $BALANCE $DENOM"
         break
     fi
 done
 
-# ---------------- DELEGATE ----------------
-echo "[INFO] Redelegating $REWARDS $DENOM..."
+# ---------------- CALCULATE SAFE RESTAKE AMOUNT ----------------
+if [ "$BALANCE" -le "$FEE_BUFFER" ]; then
+    echo "[WARN] Balance ($BALANCE) <= fee buffer ($FEE_BUFFER). Skipping delegation."
+    exit 0
+fi
 
-DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "${REWARDS}${DENOM}" \
+RESTAKE_AMOUNT=$((BALANCE - FEE_BUFFER))
+
+if [ "$RESTAKE_AMOUNT" -lt "$MIN_RESTAKE_AMOUNT" ]; then
+    echo "[INFO] Restake amount ($RESTAKE_AMOUNT) below minimum threshold."
+    exit 0
+fi
+
+echo "[INFO] Delegating $RESTAKE_AMOUNT $DENOM (keeping $FEE_BUFFER $DENOM as buffer)"
+
+# ---------------- DELEGATE ----------------
+DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "${RESTAKE_AMOUNT}${DENOM}" \
     --chain-id "$CHAIN_ID" \
     --pqc-key "node-pqc" \
     --pqc-scheme "dilithium3" \
@@ -336,7 +354,7 @@ DELEGATE_OUTPUT=$($CLI_BINARY tx staking delegate "$VALIDATOR_ADDRESS" "${REWARD
     --yes 2>&1)
 
 if echo "$DELEGATE_OUTPUT" | grep -q 'code:[[:space:]]*0'; then
-    echo "[SUCCESS] Delegation successful! Compounded $REWARDS $DENOM"
+    echo "[SUCCESS] Delegation successful! Compounded $RESTAKE_AMOUNT $DENOM"
 else
     echo "[ERROR] Delegation failed:"
     echo "$DELEGATE_OUTPUT"
