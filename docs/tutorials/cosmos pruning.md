@@ -13,8 +13,8 @@ go version
 ### Installing Cosmos Prune
 ```bash
 # clone & build cosmprund repo
-git clone https://github.com/aidilfahmi/cosmos-prune.git
-cd cosmos-prune
+git clone https://github.com/aidilfahmi/cosmos-pruner.git
+cd cosmos-pruner
 make install
 cd ~/
 ```
