@@ -1,0 +1,5 @@
+node_modules/
+.env
+chains.json
+state.json
+*.log
