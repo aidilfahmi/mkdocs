@@ -72,7 +72,7 @@ while true; do
 done
 ```
 ```shell
-sudo chmod +x /usr/local/bin/service-watchdog.sh
+sudo chmod +x /usr/local/bin/watchdog.sh
 ```
 ```bash
 sudo tee /etc/systemd/system/watchdog.service > /dev/null <<EOF
