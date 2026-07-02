@@ -6,69 +6,75 @@ sudo nano /usr/local/bin/watchdog.sh
 ```bash
 #!/bin/bash
 
-###############################################################################
-# Service CPU Watchdog
-#
-# Monitors selected services and restarts them if CPU usage stays above
-# THRESHOLD for DURATION seconds.
-###############################################################################
-
-# Services to monitor
 SERVICES=(
+    safrochaind
     nobled
     gaiad
     osmosisd
-    # node-binary you want to control
 )
 
-# Configuration
-THRESHOLD=100      # CPU percentage
-INTERVAL=5         # Check every 5 seconds
-DURATION=30        # Restart after 30 seconds above threshold
+THRESHOLD=100      # Same meaning as top: 100 = one fully utilized CPU core
+INTERVAL=5         # Seconds between checks
+DURATION=30        # Restart after 30 seconds
 LIMIT=$((DURATION / INTERVAL))
 
-# Counter for each service
-declare -A COUNTER
+CLK_TCK=$(getconf CLK_TCK)
+NCPU=$(nproc)
+
+declare -A COUNT
 
 while true; do
-
     for SERVICE in "${SERVICES[@]}"; do
 
-        PID=$(pgrep -x "$SERVICE")
+        PID=$(pidof "$SERVICE")
 
         if [[ -z "$PID" ]]; then
-            COUNTER[$SERVICE]=0
+            COUNT[$SERVICE]=0
             continue
         fi
 
-        CPU=$(ps -p "$PID" -o %cpu= | awk '{print int($1)}')
+        # Process CPU time (utime + stime)
+        read -r utime1 stime1 < <(awk '{print $14, $15}' /proc/$PID/stat)
+        total1=$((utime1 + stime1))
 
-        if [[ "$CPU" -ge "$THRESHOLD" ]]; then
+        sleep "$INTERVAL"
 
-            COUNTER[$SERVICE]=$(( ${COUNTER[$SERVICE]:-0} + 1 ))
+        # Process may have exited
+        if [[ ! -r /proc/$PID/stat ]]; then
+            COUNT[$SERVICE]=0
+            continue
+        fi
 
-            logger "[Watchdog] ${SERVICE}: CPU ${CPU}% (${COUNTER[$SERVICE]}/${LIMIT})"
+        read -r utime2 stime2 < <(awk '{print $14, $15}' /proc/$PID/stat)
+        total2=$((utime2 + stime2))
 
-            if [[ "${COUNTER[$SERVICE]}" -ge "$LIMIT" ]]; then
+        delta=$((total2 - total1))
 
-                logger "[Watchdog] Restarting ${SERVICE}.service (CPU ${CPU}% for ${DURATION}s)"
+        # Same convention as top:
+        # 100 = one CPU core fully utilized
+        CPU=$(awk -v d="$delta" -v hz="$CLK_TCK" -v sec="$INTERVAL" \
+            'BEGIN { printf "%.0f", d*100/(hz*sec) }')
 
-                systemctl restart "${SERVICE}.service"
+        echo "$(date) $SERVICE CPU=${CPU}% COUNT=${COUNT[$SERVICE]}"
 
-                COUNTER[$SERVICE]=0
-
-                # Give the service time to initialize
-                sleep 60
-            fi
-
+        if (( CPU >= THRESHOLD )); then
+            COUNT[$SERVICE]=$(( ${COUNT[$SERVICE]:-0} + 1 ))
         else
-            COUNTER[$SERVICE]=0
+            COUNT[$SERVICE]=0
+        fi
+
+        if (( ${COUNT[$SERVICE]} >= LIMIT )); then
+            logger -t service-watchdog "Restarting ${SERVICE}.service (CPU=${CPU}%)"
+
+            systemctl restart "${SERVICE}.service"
+
+            COUNT[$SERVICE]=0
+
+            # Give it time to start
+            sleep 60
         fi
 
     done
-
-    sleep "$INTERVAL"
-
 done
 ```
 ```shell
