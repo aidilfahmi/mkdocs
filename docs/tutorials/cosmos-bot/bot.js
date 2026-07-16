@@ -1,19 +1,62 @@
-const TelegramBot = require("node-telegram-bot-api");
-const axios = require("axios");
-const fs = require("fs");
-const path = require("path");
+const TelegramBot  = require("node-telegram-bot-api");
+const axios        = require("axios");
+const fs           = require("fs");
+const path         = require("path");
+const crypto       = require("crypto");
+
+// CosmJS — loaded lazily to avoid startup crash if not yet installed
+let cosmjsLoaded = false;
+let SigningStargateClient, DirectSecp256k1HdWallet, coins;
+
+async function loadCosmJS() {
+  if (cosmjsLoaded) return true;
+  try {
+    ({ SigningStargateClient }    = require("@cosmjs/stargate"));
+    ({ DirectSecp256k1HdWallet } = require("@cosmjs/proto-signing"));
+    ({ coins }                   = require("@cosmjs/amino"));
+    cosmjsLoaded = true;
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ================= CONFIG =================
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || "YOUR_BOT_TOKEN_HERE";
 const TELEGRAM_CHAT_ID   = process.env.TELEGRAM_CHAT_ID   || "YOUR_CHAT_ID_HERE";
 
-const RPC_INTERVAL    = 60_000;     // 60 sec
-const GOV_INTERVAL    = 1_800_000;  // 30 min
-const ALERT_COOLDOWN  = 600_000;    // 10 min
+// Encryption key for mnemonic storage (32-char string → 256-bit AES key)
+// Set via env var or leave default (change this to something secret!)
+const ENCRYPT_SECRET = process.env.ENCRYPT_SECRET || "cosmos-bot-secret-key-change-me!";
+
+const RPC_INTERVAL         = 60_000;    // 60 sec
+const GOV_INTERVAL         = 1_800_000; // 30 min
+const ALERT_COOLDOWN       = 600_000;   // 10 min
+const UPGRADE_ALERT_BLOCKS = 100;       // alert when this many blocks remain
 
 const CHAINS_FILE = path.join(__dirname, "chains.json");
 const STATE_FILE  = path.join(__dirname, "state.json");
+
+// ================= ENCRYPTION =================
+// Mnemonics are AES-256-GCM encrypted before writing to chains.json
+
+function encrypt(text) {
+  const iv  = crypto.randomBytes(12);
+  const key = crypto.scryptSync(ENCRYPT_SECRET, "cosmos-salt", 32);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return iv.toString("hex") + ":" + tag.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+function decrypt(payload) {
+  const [ivHex, tagHex, encHex] = payload.split(":");
+  const key = crypto.scryptSync(ENCRYPT_SECRET, "cosmos-salt", 32);
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(ivHex, "hex"));
+  decipher.setAuthTag(Buffer.from(tagHex, "hex"));
+  return decipher.update(Buffer.from(encHex, "hex")) + decipher.final("utf8");
+}
 
 // ================= PERSISTENCE =================
 
@@ -29,20 +72,21 @@ function saveJSON(file, data) {
 }
 
 let chains = loadJSON(CHAINS_FILE, []);
-// chains: [{ name, rpc, rest }]
+// chains: [{ name, rpc, rest, prefix?, denom?, gasPrice?, voter?, mnemonic_enc? }]
 
 let state = loadJSON(STATE_FILE, {});
-// state: { [chainName]: { status, lastBlock, lastAlert, gov: {} } }
+// state: { [chainName]: { status, lastBlock, lastAlert, gov:{}, upgrade:null } }
 
 function saveChains() { saveJSON(CHAINS_FILE, chains); }
-function saveState()  { saveJSON(STATE_FILE, state); }
+function saveState()  { saveJSON(STATE_FILE,  state);  }
 
 function initChainState(name) {
-  if (!state[name])            state[name] = {};
-  if (!state[name].status)     state[name].status    = "unknown";
-  if (!state[name].lastBlock)  state[name].lastBlock  = 0;
-  if (!state[name].lastAlert)  state[name].lastAlert  = 0;
-  if (!state[name].gov)        state[name].gov        = {};
+  if (!state[name])           state[name]             = {};
+  if (!state[name].status)    state[name].status      = "unknown";
+  if (!state[name].lastBlock) state[name].lastBlock   = 0;
+  if (!state[name].lastAlert) state[name].lastAlert   = 0;
+  if (!state[name].gov)       state[name].gov         = {};
+  if (!state[name].upgrade === undefined) state[name].upgrade = null;
 }
 
 // ================= BOT SETUP =================
@@ -67,6 +111,15 @@ function findChain(name) {
   return chains.find(c => c.name.toLowerCase() === name.toLowerCase());
 }
 
+// Map human vote option → cosmos VoteOption integer
+const VOTE_OPTIONS = {
+  yes:     1,
+  abstain: 2,
+  no:      3,
+  veto:    4,
+  nowithveto: 4,
+};
+
 // ================= SEND HELPERS =================
 
 async function sendMsg(chatId, text, opts = {}) {
@@ -77,7 +130,6 @@ async function sendMsg(chatId, text, opts = {}) {
   }
 }
 
-// Broadcast alert to the owner chat
 async function alert(text) {
   await sendMsg(TELEGRAM_CHAT_ID, text);
 }
@@ -182,7 +234,10 @@ async function checkGovernance(chain) {
         `🗳️ <b>New Proposal – ${chain.name}</b>\n` +
         `ID: <code>${id}</code>\n` +
         `Title: ${title}\n` +
-        `Voting ends: ${endStr}`
+        `Voting ends: ${endStr}\n\n` +
+        (chain.mnemonic_enc
+          ? `💡 Vote with: /vote ${chain.name} ${id} yes|no|abstain|veto`
+          : `💡 Add a key with /addkey to vote from bot`)
       );
       state[chain.name].gov[id].alertedNew = true;
     }
@@ -200,10 +255,161 @@ async function checkGovernance(chain) {
   }
 }
 
+// ================= UPGRADE CHECK =================
+
+async function checkUpgrade(chain) {
+  if (!chain.rest) return;
+  initChainState(chain.name);
+
+  const currentBlock = state[chain.name].lastBlock || 0;
+
+  let plan = null;
+  try {
+    const res = await axios.get(
+      `${chain.rest}/cosmos/upgrade/v1beta1/current_plan`,
+      { timeout: 8000 }
+    );
+    plan = res.data?.plan || null;
+  } catch (err) {
+    console.log(`[UPGRADE] ${chain.name} – endpoint error: ${err.message}`);
+    return;
+  }
+
+  if (!plan || !plan.height) {
+    const prev = state[chain.name].upgrade;
+    if (prev && !prev.alertedDone) {
+      await alert(
+        `✅ <b>Upgrade Complete – ${chain.name}</b>\n` +
+        `Name: <b>${prev.name}</b>\n` +
+        `Height: <code>${prev.height}</code>\n` +
+        `Chain is running the new version.`
+      );
+      state[chain.name].upgrade = { ...prev, alertedDone: true };
+    }
+    return;
+  }
+
+  const upgradeHeight = parseInt(plan.height);
+  const upgradeName   = plan.name || "unknown";
+  const blocksLeft    = upgradeHeight - currentBlock;
+
+  console.log(`[UPGRADE] ${chain.name} – "${upgradeName}" at ${upgradeHeight}, ${blocksLeft} left`);
+
+  const prev = state[chain.name].upgrade;
+  if (!prev || prev.height !== upgradeHeight || prev.name !== upgradeName) {
+    state[chain.name].upgrade = {
+      name: upgradeName, height: upgradeHeight,
+      alertedDetected: false, alerted100: false, alertedImminent: false, alertedDone: false,
+    };
+  }
+
+  const upg = state[chain.name].upgrade;
+
+  if (!upg.alertedDetected) {
+    const eta = currentBlock > 0
+      ? `~${Math.round(blocksLeft * 6 / 60)} min (6s/block est.)` : "unknown";
+    await alert(
+      `🆙 <b>Upgrade Detected – ${chain.name}</b>\n` +
+      `Name: <b>${upgradeName}</b>\n` +
+      `Upgrade height: <code>${upgradeHeight}</code>\n` +
+      `Current block: <code>${currentBlock}</code>\n` +
+      `Blocks remaining: <code>${blocksLeft}</code>\n` +
+      `ETA: ${eta}`
+    );
+    upg.alertedDetected = true;
+  }
+
+  if (!upg.alerted100 && blocksLeft > 0 && blocksLeft <= UPGRADE_ALERT_BLOCKS) {
+    await alert(
+      `⚠️ <b>Upgrade in ${blocksLeft} Blocks – ${chain.name}</b>\n` +
+      `Name: <b>${upgradeName}</b>\n` +
+      `Upgrade at: <code>${upgradeHeight}</code>\n` +
+      `Current: <code>${currentBlock}</code>\n\n` +
+      `🔧 Make sure your node binary is ready!`
+    );
+    upg.alerted100 = true;
+  }
+
+  if (upg.alerted100 && !upg.alertedImminent && blocksLeft > 0 && blocksLeft <= 10) {
+    await alert(
+      `🚨 <b>UPGRADE IMMINENT – ${chain.name}</b>\n` +
+      `Name: <b>${upgradeName}</b>\n` +
+      `Only <b>${blocksLeft} block(s)</b> remaining!\n` +
+      `Upgrade at: <code>${upgradeHeight}</code>`
+    );
+    upg.alertedImminent = true;
+  }
+}
+
+// ================= VOTE TX =================
+
+/**
+ * Broadcast a MsgVote transaction on behalf of the stored wallet.
+ * Returns { txHash, success, error }
+ */
+async function broadcastVote(chain, proposalId, voteOption) {
+  if (!await loadCosmJS()) {
+    return { success: false, error: "CosmJS not installed. Run: npm install @cosmjs/stargate @cosmjs/proto-signing @cosmjs/amino" };
+  }
+
+  if (!chain.mnemonic_enc) {
+    return { success: false, error: "No key registered for this chain. Use /addkey first." };
+  }
+
+  let mnemonic;
+  try {
+    mnemonic = decrypt(chain.mnemonic_enc);
+  } catch {
+    return { success: false, error: "Failed to decrypt stored mnemonic. Check ENCRYPT_SECRET." };
+  }
+
+  // Defaults — can be overridden per chain in chains.json
+  const prefix   = chain.prefix   || "cosmos";
+  const denom    = chain.denom    || "uatom";
+  const gasPrice = chain.gasPrice || `0.025${denom}`;
+
+  try {
+    const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, { prefix });
+    const [account] = await wallet.getAccounts();
+
+    const client = await SigningStargateClient.connectWithSigner(chain.rpc, wallet, {
+      gasPrice: { amount: gasPrice.replace(/[^0-9.]/g, ""), denom },
+    });
+
+    const voteMsg = {
+      typeUrl: "/cosmos.gov.v1beta1.MsgVote",
+      value: {
+        proposalId: BigInt(proposalId),
+        voter:      account.address,
+        option:     voteOption,
+      },
+    };
+
+    const result = await client.signAndBroadcast(
+      account.address,
+      [voteMsg],
+      "auto",
+      `Voted via Cosmos Monitor Bot`
+    );
+
+    if (result.code !== 0) {
+      return { success: false, error: `Tx failed (code ${result.code}): ${result.rawLog}` };
+    }
+
+    return { success: true, txHash: result.transactionHash, voter: account.address };
+
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+}
+
 // ================= MONITOR LOOPS =================
 
 async function runRPCMonitor() {
-  for (const chain of chains) await checkRPC(chain);
+  for (const chain of chains) {
+    await checkRPC(chain);
+    await checkUpgrade(chain);
+  }
   saveState();
 }
 
@@ -214,10 +420,7 @@ async function runGovMonitor() {
 
 // ================= BOT COMMANDS =================
 
-/**
- * /add <Name> <rpc_url> <rest_url>
- * Example: /add Atomone https://rpc-atomone.example.com https://api-atomone.example.com
- */
+// ── /add ──────────────────────────────────────────────────────────────────────
 bot.onText(/\/add (.+)/, async (msg, match) => {
   if (!authGuard(msg)) return;
 
@@ -235,7 +438,6 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     return sendMsg(msg.chat.id, `⚠️ Chain <b>${name}</b> already exists. Use /list to see all chains.`);
   }
 
-  // Quick RPC validation
   await sendMsg(msg.chat.id, `🔍 Validating RPC for <b>${name}</b>...`);
   try {
     await axios.get(`${rpc}/status`, { timeout: 5000 });
@@ -248,7 +450,6 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
 
   chains.push({ name, rpc, rest });
   saveChains();
-
   initChainState(name);
   saveState();
 
@@ -256,18 +457,192 @@ bot.onText(/\/add (.+)/, async (msg, match) => {
     `✅ <b>${name}</b> added successfully!\n\n` +
     `🔗 RPC: <code>${rpc}</code>\n` +
     `🌐 REST: <code>${rest}</code>\n\n` +
-    `Monitoring started. Use /status to check anytime.`
+    `Monitoring started. Use /status to check anytime.\n` +
+    `💡 Add a wallet key with /addkey to enable voting.`
   );
 
-  // Run immediate check
   await checkRPC({ name, rpc, rest });
+  await checkUpgrade({ name, rpc, rest });
   await checkGovernance({ name, rpc, rest });
   saveState();
 });
 
-/**
- * /list – show all monitored chains
- */
+// ── /addkey ───────────────────────────────────────────────────────────────────
+// Usage: /addkey <ChainName> <bech32_prefix> <denom> <gas_price> <mnemonic words...>
+// Example: /addkey Atomone cosmos uatom 0.025uatom word1 word2 ... word24
+bot.onText(/\/addkey (.+)/, async (msg, match) => {
+  if (!authGuard(msg)) return;
+
+  // Delete the user's message immediately to protect the mnemonic
+  try { await bot.deleteMessage(msg.chat.id, msg.message_id); } catch {}
+
+  const parts = match[1].trim().split(/\s+/);
+  if (parts.length < 6) {
+    return sendMsg(msg.chat.id,
+      "❌ Usage:\n" +
+      "<code>/addkey &lt;Name&gt; &lt;prefix&gt; &lt;denom&gt; &lt;gasPrice&gt; &lt;mnemonic...&gt;</code>\n\n" +
+      "Example:\n" +
+      "<code>/addkey Atomone cosmos uatom 0.025uatom word1 word2 ... word24</code>\n\n" +
+      "⚠️ Your message was deleted to protect your mnemonic."
+    );
+  }
+
+  const [name, prefix, denom, gasPrice, ...mnemonicWords] = parts;
+  const mnemonic = mnemonicWords.join(" ");
+
+  const chain = findChain(name);
+  if (!chain) {
+    return sendMsg(msg.chat.id,
+      `❌ Chain "<b>${name}</b>" not found. Add it first with /add.`
+    );
+  }
+
+  // Validate mnemonic by deriving address
+  if (!await loadCosmJS()) {
+    return sendMsg(msg.chat.id,
+      "❌ CosmJS not installed.\nRun: <code>npm install @cosmjs/stargate @cosmjs/proto-signing @cosmjs/amino</code>"
+    );
+  }
+
+  let voterAddress;
+  try {
+    const wallet = await DirectSecp256k1HdWallet.fromMnemonic(mnemonic, { prefix });
+    const [account] = await wallet.getAccounts();
+    voterAddress = account.address;
+  } catch (err) {
+    return sendMsg(msg.chat.id, `❌ Invalid mnemonic: ${err.message}`);
+  }
+
+  // Encrypt and store
+  const encrypted = encrypt(mnemonic);
+  const idx = chains.findIndex(c => c.name.toLowerCase() === name.toLowerCase());
+  chains[idx].mnemonic_enc = encrypted;
+  chains[idx].voter        = voterAddress;
+  chains[idx].prefix       = prefix;
+  chains[idx].denom        = denom;
+  chains[idx].gasPrice     = gasPrice;
+  saveChains();
+
+  await sendMsg(msg.chat.id,
+    `🔐 <b>Key registered for ${name}</b>\n\n` +
+    `Address: <code>${voterAddress}</code>\n` +
+    `Prefix: <code>${prefix}</code>\n` +
+    `Denom: <code>${denom}</code>\n` +
+    `Gas price: <code>${gasPrice}</code>\n\n` +
+    `✅ Mnemonic encrypted and saved.\n` +
+    `You can now use: <code>/vote ${name} &lt;proposal_id&gt; yes|no|abstain|veto</code>`
+  );
+});
+
+// ── /removekey ────────────────────────────────────────────────────────────────
+bot.onText(/\/removekey (.+)/, async (msg, match) => {
+  if (!authGuard(msg)) return;
+
+  const name  = match[1].trim();
+  const chain = findChain(name);
+
+  if (!chain) {
+    return sendMsg(msg.chat.id, `❌ Chain "<b>${name}</b>" not found.`);
+  }
+
+  if (!chain.mnemonic_enc) {
+    return sendMsg(msg.chat.id, `⚠️ No key is registered for <b>${name}</b>.`);
+  }
+
+  await bot.sendMessage(msg.chat.id,
+    `⚠️ Remove the stored key for <b>${chain.name}</b>?\n` +
+    `Voter: <code>${chain.voter || "unknown"}</code>`,
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Yes, remove key", callback_data: `confirm_removekey:${chain.name}` },
+          { text: "❌ Cancel",          callback_data: `cancel_removekey:${chain.name}` }
+        ]]
+      }
+    }
+  );
+});
+
+// ── /vote ─────────────────────────────────────────────────────────────────────
+// Usage: /vote <ChainName> <proposal_id> <yes|no|abstain|veto>
+bot.onText(/\/vote (.+)/, async (msg, match) => {
+  if (!authGuard(msg)) return;
+
+  const parts = match[1].trim().split(/\s+/);
+  if (parts.length < 3) {
+    return sendMsg(msg.chat.id,
+      "❌ Usage: <code>/vote &lt;Name&gt; &lt;proposal_id&gt; &lt;yes|no|abstain|veto&gt;</code>\n\n" +
+      "Example: <code>/vote Atomone 5 yes</code>"
+    );
+  }
+
+  const [name, proposalId, voteInput] = parts;
+  const voteKey = voteInput.toLowerCase().replace(/\s/g, "");
+  const voteOption = VOTE_OPTIONS[voteKey];
+
+  if (!voteOption) {
+    return sendMsg(msg.chat.id,
+      `❌ Invalid vote option: <b>${voteInput}</b>\n` +
+      `Valid options: <code>yes</code> · <code>no</code> · <code>abstain</code> · <code>veto</code>`
+    );
+  }
+
+  const chain = findChain(name);
+  if (!chain) {
+    return sendMsg(msg.chat.id, `❌ Chain "<b>${name}</b>" not found. Use /list to see chains.`);
+  }
+
+  if (!chain.mnemonic_enc) {
+    return sendMsg(msg.chat.id,
+      `❌ No wallet key for <b>${name}</b>.\n` +
+      `Register one with /addkey first.`
+    );
+  }
+
+  // Confirm before broadcasting
+  const voteLabels = { 1: "✅ YES", 2: "🟡 ABSTAIN", 3: "❌ NO", 4: "🚫 VETO" };
+  await bot.sendMessage(msg.chat.id,
+    `🗳️ <b>Confirm Vote</b>\n\n` +
+    `Chain: <b>${chain.name}</b>\n` +
+    `Proposal ID: <code>${proposalId}</code>\n` +
+    `Vote: <b>${voteLabels[voteOption]}</b>\n` +
+    `Voter: <code>${chain.voter || "stored wallet"}</code>`,
+    {
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [[
+          { text: "✅ Confirm & Broadcast", callback_data: `confirm_vote:${name}:${proposalId}:${voteOption}` },
+          { text: "❌ Cancel",              callback_data: `cancel_vote:${name}` }
+        ]]
+      }
+    }
+  );
+});
+
+// ── /mykeys ───────────────────────────────────────────────────────────────────
+bot.onText(/\/mykeys/, async (msg) => {
+  if (!authGuard(msg)) return;
+
+  const keyed = chains.filter(c => c.mnemonic_enc);
+  if (keyed.length === 0) {
+    return sendMsg(msg.chat.id,
+      "🔑 No keys registered yet.\n\nUse /addkey to add a wallet for voting."
+    );
+  }
+
+  const lines = keyed.map(c =>
+    `🔐 <b>${c.name}</b>\n` +
+    `   Address: <code>${c.voter || "unknown"}</code>\n` +
+    `   Prefix: <code>${c.prefix}</code>  Denom: <code>${c.denom}</code>  Gas: <code>${c.gasPrice}</code>`
+  );
+
+  await sendMsg(msg.chat.id,
+    `🔑 <b>Registered Voting Keys (${keyed.length})</b>\n\n` + lines.join("\n\n")
+  );
+});
+
+// ── /list ─────────────────────────────────────────────────────────────────────
 bot.onText(/\/list/, async (msg) => {
   if (!authGuard(msg)) return;
 
@@ -278,30 +653,30 @@ bot.onText(/\/list/, async (msg) => {
   }
 
   const lines = chains.map((c, i) => {
-    const s = state[c.name] || {};
+    const s    = state[c.name] || {};
     const icon = s.status === "up" ? "🟢" : s.status === "down" ? "🔴" : "⚪";
+    const key  = c.mnemonic_enc ? ` 🔐` : "";
     return (
-      `${i + 1}. ${icon} <b>${c.name}</b>\n` +
-      `   RPC: <code>${c.rpc}</code>\n` +
+      `${i + 1}. ${icon} <b>${c.name}</b>${key}\n` +
+      `   RPC:  <code>${c.rpc}</code>\n` +
       `   REST: <code>${c.rest}</code>\n` +
       `   Block: <code>${s.lastBlock || "N/A"}</code>`
     );
   });
 
   await sendMsg(msg.chat.id,
-    `📋 <b>Monitored Chains (${chains.length})</b>\n\n` + lines.join("\n\n")
+    `📋 <b>Monitored Chains (${chains.length})</b>\n` +
+    `🔐 = voting key registered\n\n` +
+    lines.join("\n\n")
   );
 });
 
-/**
- * /status [name] – check status of all chains or a specific one
- */
+// ── /status ───────────────────────────────────────────────────────────────────
 bot.onText(/\/status(?:\s+(.+))?/, async (msg, match) => {
   if (!authGuard(msg)) return;
 
   const targetName = match[1]?.trim();
-
-  const targets = targetName
+  const targets    = targetName
     ? chains.filter(c => c.name.toLowerCase().includes(targetName.toLowerCase()))
     : chains;
 
@@ -319,59 +694,139 @@ bot.onText(/\/status(?:\s+(.+))?/, async (msg, match) => {
   saveState();
 
   const lines = targets.map(c => {
-    const s = state[c.name] || {};
-    const icon = s.status === "up" ? "🟢" : s.status === "down" ? "🔴" : "⚪";
+    const s        = state[c.name] || {};
+    const icon     = s.status === "up" ? "🟢" : s.status === "down" ? "🔴" : "⚪";
     const govCount = Object.keys(s.gov || {}).length;
+    const upg      = s.upgrade;
+    const upgLine  = upg && !upg.alertedDone
+      ? `\n   🆙 Upgrade <b>${upg.name}</b> at <code>${upg.height}</code> ` +
+        `(${Math.max(0, upg.height - (s.lastBlock || 0))} blocks left)`
+      : "";
+    const keyLine  = c.mnemonic_enc
+      ? `\n   🔐 Voter: <code>${c.voter}</code>`
+      : `\n   🔑 No voting key (use /addkey)`;
     return (
       `${icon} <b>${c.name}</b>\n` +
       `   Status: ${s.status || "unknown"}\n` +
       `   Block: <code>${s.lastBlock || "N/A"}</code>\n` +
-      `   Active proposals tracked: ${govCount}`
+      `   Active proposals tracked: ${govCount}` +
+      upgLine + keyLine
     );
   });
 
-  await sendMsg(msg.chat.id,
-    `📊 <b>Status Report</b>\n\n` + lines.join("\n\n")
-  );
+  await sendMsg(msg.chat.id, `📊 <b>Status Report</b>\n\n` + lines.join("\n\n"));
 });
 
-/**
- * /delete <Name> – remove a chain
- */
+// ── /delete ───────────────────────────────────────────────────────────────────
 bot.onText(/\/delete (.+)/, async (msg, match) => {
   if (!authGuard(msg)) return;
 
-  const name = match[1].trim();
+  const name  = match[1].trim();
   const chain = findChain(name);
 
   if (!chain) {
-    return sendMsg(msg.chat.id,
-      `❌ Chain "<b>${name}</b>" not found. Use /list to see all chains.`
-    );
+    return sendMsg(msg.chat.id, `❌ Chain "<b>${name}</b>" not found. Use /list to see all chains.`);
   }
 
-  // Inline keyboard for confirmation
   await bot.sendMessage(msg.chat.id,
     `⚠️ Are you sure you want to delete <b>${chain.name}</b>?\n` +
-    `This will remove all monitoring and state data.`,
+    `This will remove all monitoring, state, and key data.`,
     {
       parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [[
           { text: "✅ Yes, delete", callback_data: `confirm_delete:${chain.name}` },
-          { text: "❌ Cancel",      callback_data: `cancel_delete:${chain.name}` }
+          { text: "❌ Cancel",      callback_data: `cancel_delete:${chain.name}`  }
         ]]
       }
     }
   );
 });
 
-// Handle inline button callbacks
+// ── /help ─────────────────────────────────────────────────────────────────────
+bot.onText(/\/help|\/start/, async (msg) => {
+  if (!authGuard(msg)) return;
+
+  await sendMsg(msg.chat.id,
+    `🤖 <b>Cosmos Monitor Bot</b>\n\n` +
+
+    `<b>── Chain Management ──</b>\n` +
+    `➕ /add &lt;Name&gt; &lt;rpc&gt; &lt;rest&gt;\n` +
+    `📋 /list\n` +
+    `📊 /status [name]\n` +
+    `🗑️ /delete &lt;Name&gt;\n\n` +
+
+    `<b>── Voting Keys ──</b>\n` +
+    `🔐 /addkey &lt;Name&gt; &lt;prefix&gt; &lt;denom&gt; &lt;gasPrice&gt; &lt;mnemonic&gt;\n` +
+    `🔑 /mykeys\n` +
+    `🗝️ /removekey &lt;Name&gt;\n\n` +
+
+    `<b>── Governance Voting ──</b>\n` +
+    `🗳️ /vote &lt;Name&gt; &lt;proposal_id&gt; &lt;yes|no|abstain|veto&gt;\n\n` +
+
+    `<b>── Auto Alerts ──</b>\n` +
+    `• 🔴 RPC down / 🟢 Recovered\n` +
+    `• 🗳️ New governance proposal\n` +
+    `• ⏰ Proposal ending in &lt;24h\n` +
+    `• 🆙 Chain upgrade detected\n` +
+    `• ⚠️ Upgrade in 100 blocks\n` +
+    `• 🚨 Upgrade in 10 blocks\n` +
+    `• ✅ Upgrade complete\n\n` +
+
+    `RPC/upgrade checked every <b>60s</b> · Governance every <b>30min</b>`
+  );
+});
+
+// ================= CALLBACK QUERY HANDLER =================
+
 bot.on("callback_query", async (query) => {
   if (!isAuthorized(query.message.chat.id)) return;
 
-  const [action, chainName] = query.data.split(":");
+  const parts      = query.data.split(":");
+  const action     = parts[0];
+  const chainName  = parts[1];
 
+  // ── Confirm vote ────────────────────────────────────────────────────────────
+  if (action === "confirm_vote") {
+    const [, name, proposalId, voteOptionStr] = parts;
+    const voteOption = parseInt(voteOptionStr);
+    const chain      = findChain(name);
+    const voteLabels = { 1: "YES", 2: "ABSTAIN", 3: "NO", 4: "VETO" };
+
+    await bot.editMessageText(
+      `⏳ Broadcasting vote <b>${voteLabels[voteOption]}</b> on proposal <code>${proposalId}</code> for <b>${name}</b>...`,
+      { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "HTML" }
+    );
+
+    const result = await broadcastVote(chain, proposalId, voteOption);
+
+    if (result.success) {
+      await bot.editMessageText(
+        `✅ <b>Vote Submitted!</b>\n\n` +
+        `Chain: <b>${name}</b>\n` +
+        `Proposal: <code>${proposalId}</code>\n` +
+        `Vote: <b>${voteLabels[voteOption]}</b>\n` +
+        `Voter: <code>${result.voter}</code>\n` +
+        `Tx Hash: <code>${result.txHash}</code>`,
+        { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "HTML" }
+      );
+    } else {
+      await bot.editMessageText(
+        `❌ <b>Vote Failed</b>\n\nError: ${result.error}`,
+        { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "HTML" }
+      );
+    }
+  }
+
+  // ── Cancel vote ─────────────────────────────────────────────────────────────
+  if (action === "cancel_vote") {
+    await bot.editMessageText(
+      `↩️ Vote cancelled.`,
+      { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "HTML" }
+    );
+  }
+
+  // ── Confirm delete chain ─────────────────────────────────────────────────────
   if (action === "confirm_delete") {
     const before = chains.length;
     chains = chains.filter(c => c.name !== chainName);
@@ -392,6 +847,7 @@ bot.on("callback_query", async (query) => {
     }
   }
 
+  // ── Cancel delete chain ──────────────────────────────────────────────────────
   if (action === "cancel_delete") {
     await bot.editMessageText(
       `↩️ Deletion of <b>${chainName}</b> cancelled.`,
@@ -399,32 +855,29 @@ bot.on("callback_query", async (query) => {
     );
   }
 
+  // ── Confirm remove key ───────────────────────────────────────────────────────
+  if (action === "confirm_removekey") {
+    const idx = chains.findIndex(c => c.name === chainName);
+    if (idx !== -1) {
+      delete chains[idx].mnemonic_enc;
+      delete chains[idx].voter;
+      saveChains();
+      await bot.editMessageText(
+        `🗝️ Voting key for <b>${chainName}</b> has been removed.`,
+        { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "HTML" }
+      );
+    }
+  }
+
+  // ── Cancel remove key ────────────────────────────────────────────────────────
+  if (action === "cancel_removekey") {
+    await bot.editMessageText(
+      `↩️ Key removal for <b>${chainName}</b> cancelled.`,
+      { chat_id: query.message.chat.id, message_id: query.message.message_id, parse_mode: "HTML" }
+    );
+  }
+
   await bot.answerCallbackQuery(query.id);
-});
-
-/**
- * /help – show available commands
- */
-bot.onText(/\/help|\/start/, async (msg) => {
-  if (!authGuard(msg)) return;
-
-  await sendMsg(msg.chat.id,
-    `🤖 <b>Cosmos Monitor Bot</b>\n\n` +
-    `<b>Commands:</b>\n\n` +
-    `➕ /add &lt;Name&gt; &lt;rpc_url&gt; &lt;rest_url&gt;\n` +
-    `   Add a chain to monitor\n\n` +
-    `📋 /list\n` +
-    `   Show all monitored chains\n\n` +
-    `📊 /status [name]\n` +
-    `   Check status (all or specific chain)\n\n` +
-    `🗑️ /delete &lt;Name&gt;\n` +
-    `   Remove a chain from monitoring\n\n` +
-    `<b>Automatic alerts:</b>\n` +
-    `• 🔴 RPC down / 🟢 Recovered\n` +
-    `• 🗳️ New governance proposal\n` +
-    `• ⏰ Proposal ending in &lt;24h\n\n` +
-    `RPC checked every <b>60s</b> · Governance every <b>30min</b>`
-  );
 });
 
 // ================= START =================
@@ -432,7 +885,6 @@ bot.onText(/\/help|\/start/, async (msg) => {
 console.log("🚀 Cosmos Monitor Bot starting...");
 console.log(`📡 Monitoring ${chains.length} chain(s) from chains.json`);
 
-// Initial run
 if (chains.length > 0) {
   runRPCMonitor();
   runGovMonitor();
